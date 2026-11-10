@@ -37,4 +37,5 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.media:media:1.7.0")
+    implementation("com.google.mlkit:translate:17.0.3")
 }

@@ -2,6 +2,7 @@ package com.paw.wtrtts
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -32,7 +33,13 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
+import com.google.mlkit.nl.translate.TranslatorOptions
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.util.Locale
@@ -83,6 +90,48 @@ object Progress {
         val o = load(c)
         if (o.remove(norm(url)) != null) save(c, o)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Settings: which language to read in ("en" = original, no translation).
+// ---------------------------------------------------------------------------
+object Prefs {
+    private const val P = "wtr_prefs"
+
+    fun lang(c: Context): String =
+        c.getSharedPreferences(P, Context.MODE_PRIVATE).getString("lang", "en") ?: "en"
+
+    fun setLang(c: Context, code: String) {
+        c.getSharedPreferences(P, Context.MODE_PRIVATE).edit().putString("lang", code).apply()
+    }
+}
+
+// A language you can pick: label, translation code, and TTS voices to try in order.
+class LangOpt(val label: String, val code: String, val voices: List<Locale>)
+
+object Langs {
+    private fun tags(vararg t: String): List<Locale> = t.map { Locale.forLanguageTag(it) }
+
+    val list: List<LangOpt> = listOf(
+        LangOpt("English (original)", "en", tags("en-US")),
+        LangOpt("Tagalog / Filipino", "tl", tags("fil-PH", "tl-PH")),
+        LangOpt("Chinese 中文", "zh", tags("zh-CN", "zh-TW")),
+        LangOpt("Japanese 日本語", "ja", tags("ja-JP")),
+        LangOpt("Korean 한국어", "ko", tags("ko-KR")),
+        LangOpt("Spanish", "es", tags("es-ES", "es-US")),
+        LangOpt("Indonesian", "id", tags("id-ID")),
+        LangOpt("Vietnamese", "vi", tags("vi-VN")),
+        LangOpt("Thai", "th", tags("th-TH")),
+        LangOpt("Malay", "ms", tags("ms-MY")),
+        LangOpt("French", "fr", tags("fr-FR")),
+        LangOpt("German", "de", tags("de-DE")),
+        LangOpt("Portuguese", "pt", tags("pt-BR", "pt-PT")),
+        LangOpt("Russian", "ru", tags("ru-RU")),
+        LangOpt("Hindi", "hi", tags("hi-IN")),
+        LangOpt("Arabic", "ar", tags("ar"))
+    )
+
+    fun byCode(c: String): LangOpt = list.firstOrNull { it.code == c } ?: list[0]
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +345,7 @@ class MainActivity : Activity() {
             b.text = "${speeds[speedIdx]}x"
             send(TtsService.A_RATE, rate = speeds[speedIdx])
         })
+        row.addView(btn("🌐 " + Prefs.lang(this).uppercase()) { b -> pickLanguage(b) })
 
         root.addView(
             urlBar,
@@ -400,6 +450,23 @@ class MainActivity : Activity() {
         }
     }
 
+    // Choose the language to read in. Translation happens in the reader, paragraph by paragraph.
+    private fun pickLanguage(b: Button) {
+        val labels = Langs.list.map { it.label }.toTypedArray()
+        val cur = Langs.list.indexOfFirst { it.code == Prefs.lang(this) }.coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("Read in…")
+            .setSingleChoiceItems(labels, cur) { d, which ->
+                val o = Langs.list[which]
+                Prefs.setLang(this, o.code)
+                b.text = "🌐 " + o.code.uppercase()
+                if (TtsService.alive) send(TtsService.A_LANG)
+                d.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun send(action: String, url: String? = null, rate: Float? = null, start: Int? = null) {
         val i = Intent(this, TtsService::class.java).setAction(action)
         if (url != null) i.putExtra("url", url)
@@ -427,11 +494,15 @@ class TtsService : Service() {
         const val A_STOP = "STOP"
         const val A_RATE = "RATE"
         const val A_SEEK = "SEEK"
+        const val A_LANG = "LANG"
         private const val CH = "wtr_tts"
         private const val NID = 1
         private const val MAXLEN = 3500
+        private const val AHEAD = 4        // paragraphs kept queued in the speech engine
+        private const val LOOKAHEAD = 10   // paragraphs translated ahead of the one being read
 
         // Read by the screen (same process).
+        @Volatile var alive = false
         @Volatile var playingNow = false
         @Volatile var chapterUrl = ""
         @Volatile var curPara = 0
@@ -468,6 +539,20 @@ class TtsService : Service() {
     private var rate = 1f
     private var loadToken = 0
 
+    // Translation. lang "en" = read the original text.
+    private var lang: LangOpt = Langs.list[0]
+    private var translator: Translator? = null
+    private var trans: Array<String?> = arrayOfNulls<String>(0)
+    private var transBusy = false
+    private var transTok = 0
+    private var langTok = 0
+    private var preparing = false
+
+    // Speech queue: only a few paragraphs are queued at a time so translation can run ahead.
+    private var qNext = 0
+    private var lastStarted = -1
+    private var errStreak = 0
+
     @Volatile
     private var gen = 0
 
@@ -480,6 +565,7 @@ class TtsService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        alive = true
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CH, "Reading", NotificationManager.IMPORTANCE_LOW)
         )
@@ -516,34 +602,63 @@ class TtsService : Service() {
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                ready = true
-                tts?.language = Locale.US
                 tts?.setAudioAttributes(audioAttrs)
                 tts?.setSpeechRate(rate)
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         val p = utteranceId?.split("_") ?: return
-                        if (p.size == 2 && p[0].toIntOrNull() == gen) {
-                            val c = p[1].toIntOrNull() ?: return
-                            idx = c
-                            main.post { publishProgress() }
+                        if (p.size != 2) return
+                        val g = p[0].toIntOrNull() ?: return
+                        val c = p[1].toIntOrNull() ?: return
+                        if (g != gen) return
+                        main.post {
+                            if (g == gen) {
+                                errStreak = 0
+                                idx = c
+                                lastStarted = c
+                                publishProgress()
+                                pump()
+                            }
                         }
                     }
 
                     override fun onDone(utteranceId: String?) {
-                        val p = utteranceId?.split("_") ?: return
-                        if (p.size != 2) return
-                        if (p[0].toIntOrNull() == gen &&
-                            p[1].toIntOrNull() == chunks.size - 1 && playing
-                        ) {
-                            main.post { goNext(true) }
-                        }
+                        finished(utteranceId, false)
                     }
 
                     @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) {}
+                    override fun onError(utteranceId: String?) {
+                        finished(utteranceId, true)
+                    }
                 })
+                ready = true
+                applyLang(Prefs.lang(this))
             }
+        }
+    }
+
+    // A paragraph finished (or failed) being spoken.
+    private fun finished(id: String?, error: Boolean) {
+        val p = id?.split("_") ?: return
+        if (p.size != 2) return
+        val g = p[0].toIntOrNull() ?: return
+        val c = p[1].toIntOrNull() ?: return
+        main.post {
+            if (g != gen || !playing) return@post
+            if (error) {
+                errStreak++
+                if (errStreak >= 5) {
+                    title = "Speech failed. Check text-to-speech settings."
+                    pause()
+                    return@post
+                }
+            }
+            if (c >= chunks.size - 1) {
+                goNext(true)
+                return@post
+            }
+            if (c > lastStarted) lastStarted = c
+            pump()
         }
     }
 
@@ -567,6 +682,7 @@ class TtsService : Service() {
             }
             A_TOGGLE -> if (playing) pause() else if (chunks.isNotEmpty()) play()
             A_NEXT -> goNext(false)
+            A_LANG -> if (ready) applyLang(Prefs.lang(this))
             A_RATE -> {
                 rate = i.getFloatExtra("rate", 1f)
                 tts?.setSpeechRate(rate)
@@ -602,6 +718,8 @@ class TtsService : Service() {
         curUrl = url
         chapterUrl = ""
         nextUrl = null
+        transTok++
+        transBusy = false
         title = "Loading chapter…"
         playing = true
         if (!wl.isHeld) wl.acquire(10 * 60 * 60 * 1000L)
@@ -633,6 +751,7 @@ class TtsService : Service() {
                 nextUrl = nx
                 title = ttl
                 buildChunks(paras)
+                resetTrans()
                 idx = chunkFor(pendingStart)
                 pendingStart = 0
                 chapterUrl = curUrl
@@ -742,12 +861,148 @@ class TtsService : Service() {
             main.postDelayed({ if (playing) speakFrom(start) }, 500)
             return
         }
+        if (preparing) return // starts by itself when the translation is ready
         t.stop()
         gen++
+        qNext = start
+        lastStarted = start - 1
+        errStreak = 0
+        pump()
+    }
+
+    // Keep a few paragraphs queued in the speech engine (translated first if needed).
+    private fun pump() {
+        val t = tts ?: return
+        if (!playing || !ready || preparing) return
         val list = chunks
-        for (i in start until list.size) {
-            t.speak(list[i], TextToSpeech.QUEUE_ADD, null, "${gen}_$i")
+        while (qNext < list.size && qNext <= lastStarted + AHEAD) {
+            val text = textFor(qNext) ?: break
+            t.speak(text, TextToSpeech.QUEUE_ADD, null, "${gen}_$qNext")
+            qNext++
         }
+        translateMore()
+    }
+
+    // The text to speak for a paragraph: original, or its translation (null = not ready yet).
+    private fun textFor(i: Int): String? {
+        if (lang.code == "en") return chunks.getOrNull(i)
+        if (translator == null) return null
+        return trans.getOrNull(i)
+    }
+
+    // Translate the next paragraph that is still missing (one at a time, a few ahead of the speech).
+    private fun translateMore() {
+        val tr = translator ?: return
+        if (transBusy) return
+        val list = chunks
+        val arr = trans
+        if (arr.size != list.size) return
+        var i = qNext
+        val end = minOf(list.size, qNext + LOOKAHEAD)
+        while (i < end && arr[i] != null) i++
+        if (i >= end) return
+        val k = i
+        val tok = transTok
+        transBusy = true
+        tr.translate(list[k])
+            .addOnSuccessListener { out ->
+                if (tok == transTok) {
+                    arr[k] = if (out.isNullOrBlank()) list[k] else out
+                    transBusy = false
+                    pump()
+                }
+            }
+            .addOnFailureListener {
+                if (tok == transTok) {
+                    arr[k] = list[k]
+                    transBusy = false
+                    pump()
+                }
+            }
+    }
+
+    private fun resetTrans() {
+        transTok++
+        transBusy = false
+        trans = arrayOfNulls<String>(chunks.size)
+    }
+
+    // ---- language ----------------------------------------------------------
+
+    private fun applyVoice(opt: LangOpt): Boolean {
+        val t = tts ?: return false
+        for (loc in opt.voices) {
+            val r = t.setLanguage(loc)
+            if (r >= TextToSpeech.LANG_AVAILABLE) return true
+        }
+        return false
+    }
+
+    private fun notice(msg: String) {
+        title = msg
+        Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
+        update()
+    }
+
+    private fun resumeAfterLang() {
+        if (playing && chunks.isNotEmpty()) speakFrom(idx) else update()
+    }
+
+    // Switch the reading language: set the voice, download the translation model if needed.
+    private fun applyLang(code: String) {
+        val want = Langs.byCode(code)
+        langTok++
+        val tok = langTok
+        transTok++
+        transBusy = false
+        translator?.close()
+        translator = null
+        preparing = false
+        gen++
+        tts?.stop()
+        if (want.code == "en") {
+            lang = want
+            applyVoice(want)
+            resumeAfterLang()
+            return
+        }
+        if (!applyVoice(want)) {
+            lang = Langs.list[0]
+            applyVoice(lang)
+            notice("No ${want.label} voice on this phone. Install one in Settings > Text-to-speech. Reading English instead.")
+            resumeAfterLang()
+            return
+        }
+        lang = want
+        preparing = true
+        update()
+        val t = Translation.getClient(
+            TranslatorOptions.Builder()
+                .setSourceLanguage(TranslateLanguage.ENGLISH)
+                .setTargetLanguage(want.code)
+                .build()
+        )
+        t.downloadModelIfNeeded(DownloadConditions.Builder().build())
+            .addOnSuccessListener {
+                if (tok != langTok) {
+                    t.close()
+                } else {
+                    translator = t
+                    preparing = false
+                    resetTrans()
+                    resumeAfterLang()
+                }
+            }
+            .addOnFailureListener {
+                t.close()
+                if (tok == langTok) {
+                    preparing = false
+                    lang = Langs.list[0]
+                    applyVoice(lang)
+                    notice("Couldn't download the ${want.label} translation. Check your internet. Reading English instead.")
+                    resumeAfterLang()
+                }
+            }
     }
 
     private fun play() {
@@ -857,8 +1112,9 @@ class TtsService : Service() {
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val status = when {
+            preparing -> "Preparing ${lang.label} translation…"
             playing && chunks.isEmpty() -> "Loading…"
-            playing -> "Reading…"
+            playing -> if (lang.code == "en") "Reading…" else "Reading in ${lang.label}…"
             else -> "Paused"
         }
         return NotificationCompat.Builder(this, CH)
@@ -884,9 +1140,11 @@ class TtsService : Service() {
     }
 
     override fun onDestroy() {
+        alive = false
         chapterUrl = ""
         playingNow = false
         onProgress = null
+        translator?.close()
         tts?.shutdown()
         web.destroy()
         session.release()
