@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.app.AlertDialog
 import android.app.ApplicationExitInfo
+import android.app.DownloadManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -37,6 +38,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import com.google.mlkit.common.MlKitException
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
@@ -201,6 +203,43 @@ object CrashLog {
             }
         }
         return if (sb.isEmpty()) null else sb.toString()
+    }
+}
+
+// Full cause chain of an error, so "1 out of 1 tasks failed" shows what really failed.
+fun describe(e: Throwable): String {
+    val sb = StringBuilder()
+    var x: Throwable? = e
+    var n = 0
+    while (x != null && n < 5) {
+        if (n > 0) sb.append("\ncaused by ")
+        sb.append(x.javaClass.simpleName).append(": ").append(x.message ?: "")
+        if (x is MlKitException) sb.append(" [code ").append(x.errorCode).append("]")
+        x = x.cause
+        n++
+    }
+    return sb.toString()
+}
+
+// What Android's download manager says about this app's recent downloads (the model download uses it).
+fun dlInfo(c: Context): String {
+    return try {
+        val dm = c.getSystemService(DownloadManager::class.java)
+        val sb = StringBuilder()
+        dm.query(DownloadManager.Query()).use { cur ->
+            var n = 0
+            while (cur.moveToNext() && n < 3) {
+                val st = cur.getInt(cur.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                val rs = cur.getInt(cur.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+                val uri = cur.getString(cur.getColumnIndexOrThrow(DownloadManager.COLUMN_URI)) ?: ""
+                sb.append("\n\nDownload status ").append(st).append(", reason ").append(rs)
+                    .append("\n").append(uri.take(90))
+                n++
+            }
+        }
+        sb.toString()
+    } catch (e: Exception) {
+        ""
     }
 }
 
@@ -585,7 +624,7 @@ class MainActivity : Activity() {
     private fun showError(title: String, e: Throwable) {
         AlertDialog.Builder(this)
             .setTitle(title)
-            .setMessage(e.javaClass.simpleName + ": " + (e.message ?: ""))
+            .setMessage(describe(e) + dlInfo(this))
             .setPositiveButton("OK", null)
             .show()
     }
@@ -1129,10 +1168,10 @@ class TtsService : Service() {
                 }
                 .addOnFailureListener { e ->
                     t.close()
-                    failed(e.javaClass.simpleName + ": " + (e.message ?: ""))
+                    failed(describe(e) + dlInfo(applicationContext))
                 }
         } catch (e: Throwable) {
-            failed(e.javaClass.simpleName + ": " + (e.message ?: ""))
+            failed(describe(e) + dlInfo(applicationContext))
         }
     }
 
