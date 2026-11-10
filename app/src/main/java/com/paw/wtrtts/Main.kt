@@ -2,7 +2,9 @@ package com.paw.wtrtts
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.AlertDialog
+import android.app.ApplicationExitInfo
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -132,6 +134,74 @@ object Langs {
     )
 
     fun byCode(c: String): LangOpt = list.firstOrNull { it.code == c } ?: list[0]
+}
+
+// ---------------------------------------------------------------------------
+// Crash report: remembers the last crash and why the app was last killed, and
+// the screen shows it the next time you open the app.
+// ---------------------------------------------------------------------------
+object CrashLog {
+    private const val P = "wtr_crash"
+    @Volatile private var installed = false
+
+    fun install(c: Context) {
+        if (installed) return
+        installed = true
+        val app = c.applicationContext
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                app.getSharedPreferences(P, Context.MODE_PRIVATE).edit()
+                    .putString("trace", sw.toString().take(6000)).commit()
+            } catch (x: Throwable) {
+            }
+            prev?.uncaughtException(t, e)
+        }
+    }
+
+    fun report(c: Context): String? {
+        val sp = c.getSharedPreferences(P, Context.MODE_PRIVATE)
+        val sb = StringBuilder()
+        val tr = sp.getString("trace", null)
+        if (tr != null) {
+            sb.append("Crash:\n").append(tr.take(1500))
+            sp.edit().remove("trace").apply()
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                val am = c.getSystemService(ActivityManager::class.java)
+                val l = am.getHistoricalProcessExitReasons(c.packageName, 0, 1)
+                if (l.isNotEmpty()) {
+                    val x = l[0]
+                    if (x.timestamp > sp.getLong("seen", 0L)) {
+                        sp.edit().putLong("seen", x.timestamp).apply()
+                        val d = x.description ?: ""
+                        val bad = x.reason in listOf(
+                            ApplicationExitInfo.REASON_CRASH,
+                            ApplicationExitInfo.REASON_CRASH_NATIVE,
+                            ApplicationExitInfo.REASON_ANR,
+                            ApplicationExitInfo.REASON_LOW_MEMORY,
+                            ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE,
+                            ApplicationExitInfo.REASON_SIGNALED,
+                            ApplicationExitInfo.REASON_INITIALIZATION_FAILURE,
+                            ApplicationExitInfo.REASON_DEPENDENCY_DIED,
+                            ApplicationExitInfo.REASON_OTHER
+                        )
+                        if (bad && !d.contains("install", true)) {
+                            if (sb.isNotEmpty()) sb.append("\n\n")
+                            sb.append("Android stopped the app: reason ").append(x.reason)
+                                .append(", status ").append(x.status)
+                            if (d.isNotEmpty()) sb.append(", ").append(d)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+            }
+        }
+        return if (sb.isEmpty()) null else sb.toString()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +356,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashLog.install(this)
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
@@ -363,6 +434,13 @@ class MainActivity : Activity() {
             )
         )
         setContentView(root)
+        CrashLog.report(this)?.let { msg ->
+            AlertDialog.Builder(this)
+                .setTitle("The app stopped last time")
+                .setMessage(msg)
+                .setPositiveButton("OK", null)
+                .show()
+        }
     }
 
     override fun onStart() {
@@ -457,13 +535,58 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Read in…")
             .setSingleChoiceItems(labels, cur) { d, which ->
-                val o = Langs.list[which]
-                Prefs.setLang(this, o.code)
-                b.text = "🌐 " + o.code.uppercase()
-                if (TtsService.alive) send(TtsService.A_LANG)
                 d.dismiss()
+                chooseLang(Langs.list[which], b)
             }
             .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // Download the translation first, here on screen, so any problem is visible. Then switch.
+    private fun chooseLang(o: LangOpt, b: Button) {
+        if (o.code == "en") {
+            Prefs.setLang(this, "en")
+            b.text = "🌐 EN"
+            if (TtsService.alive) send(TtsService.A_LANG)
+            return
+        }
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Getting ${o.label}…")
+            .setMessage("Downloading the translation (about 30 MB, first time only). Keep this screen open.")
+            .setCancelable(false)
+            .show()
+        try {
+            val t = Translation.getClient(
+                TranslatorOptions.Builder()
+                    .setSourceLanguage(TranslateLanguage.ENGLISH)
+                    .setTargetLanguage(o.code)
+                    .build()
+            )
+            t.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                .addOnSuccessListener {
+                    t.close()
+                    try { dlg.dismiss() } catch (x: Exception) { }
+                    Prefs.setLang(this, o.code)
+                    b.text = "🌐 " + o.code.uppercase()
+                    Toast.makeText(this, "${o.label} translation ready", Toast.LENGTH_SHORT).show()
+                    if (TtsService.alive) send(TtsService.A_LANG)
+                }
+                .addOnFailureListener { e ->
+                    t.close()
+                    try { dlg.dismiss() } catch (x: Exception) { }
+                    showError("Couldn't download the ${o.label} translation", e)
+                }
+        } catch (e: Throwable) {
+            try { dlg.dismiss() } catch (x: Exception) { }
+            showError("Couldn't start the ${o.label} translation", e)
+        }
+    }
+
+    private fun showError(title: String, e: Throwable) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(e.javaClass.simpleName + ": " + (e.message ?: ""))
+            .setPositiveButton("OK", null)
             .show()
     }
 
@@ -565,6 +688,7 @@ class TtsService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        CrashLog.install(this)
         alive = true
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CH, "Reading", NotificationManager.IMPORTANCE_LOW)
@@ -976,33 +1100,40 @@ class TtsService : Service() {
         lang = want
         preparing = true
         update()
-        val t = Translation.getClient(
-            TranslatorOptions.Builder()
-                .setSourceLanguage(TranslateLanguage.ENGLISH)
-                .setTargetLanguage(want.code)
-                .build()
-        )
-        t.downloadModelIfNeeded(DownloadConditions.Builder().build())
-            .addOnSuccessListener {
-                if (tok != langTok) {
+        val failed = { why: String ->
+            if (tok == langTok) {
+                preparing = false
+                lang = Langs.list[0]
+                applyVoice(lang)
+                notice("Couldn't start the ${want.label} translation ($why). Reading English instead.")
+                resumeAfterLang()
+            }
+        }
+        try {
+            val t = Translation.getClient(
+                TranslatorOptions.Builder()
+                    .setSourceLanguage(TranslateLanguage.ENGLISH)
+                    .setTargetLanguage(want.code)
+                    .build()
+            )
+            t.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                .addOnSuccessListener {
+                    if (tok != langTok) {
+                        t.close()
+                    } else {
+                        translator = t
+                        preparing = false
+                        resetTrans()
+                        resumeAfterLang()
+                    }
+                }
+                .addOnFailureListener { e ->
                     t.close()
-                } else {
-                    translator = t
-                    preparing = false
-                    resetTrans()
-                    resumeAfterLang()
+                    failed(e.javaClass.simpleName + ": " + (e.message ?: ""))
                 }
-            }
-            .addOnFailureListener {
-                t.close()
-                if (tok == langTok) {
-                    preparing = false
-                    lang = Langs.list[0]
-                    applyVoice(lang)
-                    notice("Couldn't download the ${want.label} translation. Check your internet. Reading English instead.")
-                    resumeAfterLang()
-                }
-            }
+        } catch (e: Throwable) {
+            failed(e.javaClass.simpleName + ": " + (e.message ?: ""))
+        }
     }
 
     private fun play() {
